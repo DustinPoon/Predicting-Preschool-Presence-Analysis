@@ -1,0 +1,847 @@
+---
+title: "Who is Missing? Predicting Preschool Presence"
+author: "Dustin Poon & Jerry Eiswerth"
+output: 
+  beamer_presentation: 
+    theme: "Boadilla"
+    colortheme: "rose"
+    fonttheme: "structurebold"
+    slide_leve: 3
+    toc: true
+classoption: "aspectratio=169" 
+---
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results = "hide"}
+library(tidyverse)
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+library(leaps)
+library(pls)
+library(glmnet) 
+library(ISLR)
+library(FNN)
+library(latex2exp)
+library(np)
+library(randomForest)
+library(neuralnet)
+library(AICcmodavg)
+library(gtsummary)
+library(xfun)
+library(skimr)
+
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+Data <- read_csv("Preschool.csv")
+Data <- Data %>%
+  select(-treatment)
+```
+
+```{r}
+Data_col_names <- names(Data)
+# Fix "N/A" in the data set
+Data[Data == 999999] <- NA
+names(Data) <- Data_col_names
+```
+
+```{r}
+Table <- tbl_summary(Data)
+```
+
+```{r}
+skim(Data)
+```
+
+
+```{r}
+Data <- Data %>%
+  mutate(copayment_amount = replace(copayment_amount,Data$copayment == "No", 0)) %>%
+  dplyr::select(age_parent, income, single, nchildren, birthweight_fchild, ndays_absentsick, ndays_absentother, working_hours, work_predictable, commute_home_work, commute_home_preschool, parent_drops, parent_picks, commute_home_preschool, safe, sendifsick, parent_takescare, other_takescare, copayment_amount, ndaysoktomiss, pref1_miss, pref2_miss, pref3_miss, pref4_miss, pref5_miss, income, attended_all, potential_all)
+
+```
+
+```{r}
+# Explain why we excluded N/A's
+Data$Attendance_ratio <- (as.numeric(Data$attended_all) / as.numeric(Data$potential_all))
+#Data <- na.omit(Data)
+Data <- rename(Data, Safe = safe)
+Data <- rename(Data, Single = single)
+Data <- rename(Data, Sendifsick = sendifsick)
+Data <- rename(Data, Parent_takescare = parent_takescare)
+Data <- rename(Data, Other_takescare = other_takescare)
+Data <- rename(Data, Parent_drops = parent_drops)
+Data <- rename(Data, Parent_picks = parent_picks)
+Data <- rename(Data, Pref1_miss = pref1_miss)
+Data <- rename(Data, Pref2_miss = pref2_miss)
+Data <- rename(Data, Pref3_miss = pref3_miss)
+Data <- rename(Data, Pref4_miss = pref4_miss)
+Data <- rename(Data, Pref5_miss = pref5_miss)
+```
+
+### Dummyized
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+Data <- Data %>%
+  filter(birthweight_fchild != "") %>%
+  filter(Attendance_ratio != "NaN") %>%
+  filter(Attendance_ratio != 0) %>%
+  mutate_at(c('age_parent', 'nchildren', 'ndays_absentsick', 'ndays_absentother', 'working_hours', 'work_predictable', 'commute_home_work', 'commute_home_preschool', 'ndaysoktomiss', 'copayment_amount', 'income'), as.numeric) %>%
+  # Turn birthweight_fchild into binary
+  mutate(birthweight = if_else(birthweight_fchild == "Less than 3.5 pounds", 0, 0),
+         birthweight = if_else(birthweight_fchild == "3.5-5.5 pounds", 0, birthweight),
+         birthweight = if_else(birthweight_fchild == "More than 5.5 pounds", 1, birthweight)) %>%
+  # Make safe dummy
+  mutate(safe = if_else(Safe == "Not Safe", 0, 0),
+         safe = if_else(Safe == "Safe", 1, safe)) %>%
+  # Make single dummy
+  mutate(single = if_else(Single == "No", 0, 0),
+         single = if_else(Single == "Yes", 1, single)) %>%
+  # Make parent drops dummy
+  mutate(parent_drops = if_else(Parent_drops == "Someone Else", 0, 0),
+         parent_drops = if_else(Parent_drops == "Parent", 1, parent_drops)) %>%
+  # Make parent picks dummy
+  mutate(parent_picks = if_else(Parent_picks == "Someone Else", 0, 0),
+         parent_picks = if_else(Parent_picks == "Parent", 1, parent_picks)) %>%
+  # Make sendifsick dummy
+  mutate(sendifsick = if_else(Sendifsick == "No", 0, 0),
+         sendifsick = if_else(Sendifsick == "Yes", 1, sendifsick)) %>%
+  # Turn parent_takescare and other_takescare into ordered categorical
+  mutate(parent_takescare = if_else(Parent_takescare == "Very easy", 1, 1),
+         parent_takescare = if_else(Parent_takescare == "Fairly easy", 2, parent_takescare),
+         parent_takescare = if_else(Parent_takescare == "Neither", 3, parent_takescare),
+         parent_takescare = if_else(Parent_takescare == "Fairly difficult", 4, parent_takescare),
+         parent_takescare = if_else(Parent_takescare == "Very difficult", 5, parent_takescare)) %>%
+  mutate(other_takescare = if_else(Other_takescare == "Very easy", 1, 0),
+         other_takescare = if_else(Other_takescare == "Fairly easy", 2, other_takescare),
+         other_takescare = if_else(Other_takescare == "Neither", 3, other_takescare),
+         other_takescare = if_else(Other_takescare == "Fairly difficult", 4, other_takescare),
+         other_takescare = if_else(Other_takescare == "Very difficult", 5, other_takescare)) %>%
+  # Turn preference variables in ordered categorical
+  mutate(pref1_miss = if_else(Pref1_miss == "Strongly Disagree", 1, 1),
+         pref1_miss = if_else(Pref1_miss == "Disagree", 2, pref1_miss),
+         pref1_miss = if_else(Pref1_miss == "Neither", 3, pref1_miss),
+         pref1_miss = if_else(Pref1_miss == "Agree", 4, pref1_miss),
+         pref1_miss = if_else(Pref1_miss == "Strongly Agree", 5, pref1_miss)) %>%
+  mutate(pref2_miss = if_else(Pref2_miss == "Strongly Disagree", 1, 1),
+         pref2_miss = if_else(Pref2_miss == "Disagree", 2, pref2_miss),
+         pref2_miss = if_else(Pref2_miss == "Neither", 3, pref2_miss),
+         pref2_miss = if_else(Pref2_miss == "Agree", 4, pref2_miss),
+         pref2_miss = if_else(Pref2_miss == "Strongly Agree", 5, pref2_miss)) %>%
+  mutate(pref3_miss = if_else(Pref3_miss == "Strongly Disagree", 1, 1),
+         pref3_miss = if_else(Pref3_miss == "Disagree", 2, pref3_miss),
+         pref3_miss = if_else(Pref3_miss == "Neither", 3, pref3_miss),
+         pref3_miss = if_else(Pref3_miss == "Agree", 4, pref3_miss),
+         pref3_miss = if_else(Pref3_miss == "Strongly Agree", 5, pref3_miss)) %>%
+  mutate(pref4_miss = if_else(Pref4_miss == "Strongly Disagree", 1, 1),
+         pref4_miss = if_else(Pref4_miss == "Disagree", 2, pref4_miss),
+         pref4_miss = if_else(Pref4_miss == "Neither", 3, pref4_miss),
+         pref4_miss = if_else(Pref4_miss == "Agree", 4, pref4_miss),
+         pref4_miss = if_else(Pref4_miss == "Strongly Agree", 5, pref4_miss)) %>%
+  mutate(pref5_miss = if_else(Pref5_miss == "Strongly Disagree", 1, 1),
+         pref5_miss = if_else(Pref5_miss == "Disagree", 2, pref5_miss),
+         pref5_miss = if_else(Pref5_miss == "Neither", 3, pref5_miss),
+         pref5_miss = if_else(Pref5_miss == "Agree", 4, pref5_miss),
+         pref5_miss = if_else(Pref5_miss == "Strongly Agree", 5, pref5_miss)) %>%
+    # Dropping race_parent: Mostly black and hispanic
+    # Siblings: Most are only children
+    # health_fchild: Most are in very good health
+    # Drop fem_child: Not significant
+  dplyr::select(Attendance_ratio, age_parent, single, nchildren, birthweight, ndays_absentsick, ndays_absentother, working_hours, work_predictable, commute_home_work, commute_home_preschool, parent_drops, parent_picks, commute_home_preschool, safe, sendifsick, parent_takescare, other_takescare, copayment_amount, ndaysoktomiss, pref1_miss, pref2_miss, pref3_miss, pref4_miss, pref5_miss, income)
+
+```
+## imp data 
+
+```{r}
+library(Hmisc)
+aq_imp <- aregImpute( ~ ...,
+                     n.impute = 1,
+                     type = "pmm",
+                     data = Data)
+```
+
+### Summary Stats
+
+```{r}
+#skim(Data)
+```
+
+```{r}
+Table <- tbl_summary(Data[0:7])
+```
+
+```{r}
+summary(Data)
+normalized_dataset <- as.data.frame(scale(Data))
+# Calculate column means
+means <- colMeans(normalized_dataset)
+
+# Create a table with column names and means
+summary_table <- data.frame(Column = names(means), Mean = means)
+
+summary_table <- summary_table %>% arrange(desc(Mean))
+# Print the summary table
+print(summary_table)
+#not standarlized/normilizzed  
+```
+
+```{r}
+# Assuming you have a dataset named "Data" with variables "Attendance_ratio", "income", and "nchildren"
+p <- ggplot(data = Data, aes(x = Attendance_ratio, y = income, fill = factor(nchildren))) +
+  geom_boxplot() +
+  labs(
+    title = "Boxplot of Income by Attendance Ratio",
+    subtitle = "Figure 1"
+  )
+
+print(p)
+```
+
+
+```{r}
+p <- ggplot(data = Data, aes(x = income, y = Attendance_ratio, color = factor(nchildren))) +
+  geom_point() + geom_smooth(method = "lm", se =F)+
+  labs(
+    title = "Boxplot of Income by Attendance Ratio",
+    subtitle = "Figure 1"
+  )
+p
+
+```
+
+```{r}
+p <- ggplot(data = Data, aes(x = income, y = Attendance_ratio, color = factor(single))) +
+  geom_point() + geom_smooth(method = "lm")+
+  labs(
+    title = "Boxplot of Income by Attendance Ratio",
+    subtitle = "Figure 1"
+  )
+p
+
+```
+
+```{r}
+p <- ggplot(data = Data, aes(x = income, y = Attendance_ratio)) +
+  geom_point() +
+  labs(
+    title = "Relationship between Income and Attendance Ratio",
+    x = "Income",
+    y = "Attendance Ratio"
+  )
+
+print(p)
+#no discountinuy 
+```
+
+```{r}
+p <- ggplot(data = Data, aes(x = Attendance_ratio, y = age_parent)) +
+  geom_point() +
+  labs(
+    title = "Relationship between Income and Attendance Ratio",
+    x = "Attendance Ratio",
+    y = "age_parent"
+  )
+
+print(p)
+
+```
+
+### SpLit
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+n_obs <- nrow(Data) # total sample size
+Data_1 <- Data[1:floor(n_obs/3),]
+Data_2 <- Data[(floor(n_obs/3)+1):floor(2*n_obs/3),]
+Test_sample <- Data[(floor(2*n_obs/3)+1):n_obs,]
+Training_sample <- rbind(Data_1, Data_2)
+K <- ncol(Data)  # number of variables 
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+Data_Reduced <- Data %>%
+  dplyr::select(-pref1_miss, -pref2_miss, -pref3_miss, -pref4_miss, -pref5_miss)
+Data_1R <- Data_Reduced[1:floor(n_obs/3),]
+Data_2R <- Data_Reduced[(floor(n_obs/3)+1):floor(2*n_obs/3),]
+Test_sample_R <- Data[(floor(2*n_obs/3)+1):n_obs,]
+Training_sample_R <- rbind(Data_1R, Data_2R)
+K_R <- ncol(Data_Reduced)
+```
+
+### Formulaize
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+
+gen_formula <- function(y_name, X_names){
+  formu <- as.formula(
+    paste(y_name,"~", 
+          paste(X_names, collapse = " + ")) )
+  return(formu)
+}
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# We make a function that computes the training and test MSE 
+# when y_name is the name of the dependent variable, 
+# and X_name are the names of the regressors 
+MSEs <- function(X_name, Y_name,  training_data, test_data)
+  {
+  form <- gen_formula( y_name = Y_name , X_names = X_name ) # Make the formula
+  reg_results <- lm(form, data = training_data) # Regress the formula on the training data set
+  
+  df_training <- training_data %>% 
+    add_residuals(reg_results) %>%  # Adds a column of residuals to training_data called "resid"
+    summarize( MSE = mean(resid^2) ) # Computes the MSE of the training sample
+  training_MSE <- df_training[1,1]  # Get the training sample MSE as a number
+  
+  df_test <- test_data %>% 
+    add_residuals(reg_results) %>%  # Adds a column of residuals to test_data called "resid"
+    summarize( MSE = mean(resid^2) ) # Computes the MSE of the test sample
+  test_MSE <- df_test[1,1]  # Get the test sample MSE as a number
+  k <- length(X_name)  # Report the number of X s
+  return(c( k , training_MSE , test_MSE ))
+}
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# Function to help get all the possible combination of variables
+# It takes names from a vector according to where the 1 are
+name_from_bin <- function(b, vars){
+  return(vars[as.logical(b)])
+}
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# Function that generates all the possible models with a set of variables
+all_models <- function(variables){
+  # How many variables in "variables"?
+  K <- length(variables)
+  # Use binary representation
+  bin_vec <- rep(list(0:1), K)
+  # Makes vectors of 1 and 0
+  # Consider all of the different combinations, except the empty model. 
+  # There will be 2^K - 1 combinations
+  bin_mat <- expand.grid(bin_vec)[-1, ]
+
+  # Initialize the results. The loop will fill that list
+  list_of_RHS <- list()
+  # Fill up the list by looping over all combinations
+  for(i in 1:nrow(bin_mat)){
+    list_of_RHS[[i]] <- name_from_bin(bin_mat[i, ], variables)
+  }
+  return(list_of_RHS) # Each row of that list is a combination of covariates
+}
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# function that estimates all the possible models and computes the test MSE
+all_subset_regression <- function(covariates_to_consider, y_var, train_dat, test_dat)
+  {
+  models_to_consider <- all_models(covariates_to_consider) # Makes all the possible combos
+  
+  # For each combo, run lm() and compute the training and test MSE
+  # Map() is a function that loops over stuff in a more efficient way than "for"
+  # It maps "models_to_consider" as "X_name" in the function "MSEs", 
+  # and we add the other arguments of the MSEs function 
+  results <- map(models_to_consider, MSEs, Y_name = y_var, training_data = train_dat,
+                 test_data = test_dat) 
+  # The "results" will be a list of 3 columns. 
+  # First one is the number of X, second is the training MSE, third is the test MSE
+  useful_results <- matrix(unlist(results), ncol = 3, byrow = TRUE) # Format the "results" nicely
+  useful_results <- as_tibble(useful_results)
+  names(useful_results) <- c(
+    "num_vars",
+    "training_error","test_error")
+  return(useful_results)
+}
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+max_X <- colnames(Training_sample_R)[-c(1,which(colnames(Training_sample_R) == "Attendance_ratio"))]
+max_X
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = "hide"}
+## Have to drop some variables or this won't run.
+#some are insignificant, so not good predictors anyway
+library(modelr)  # needed for the add_residual function to work
+performances <- all_subset_regression(covariates_to_consider = max_X,
+                                      y_var = "Attendance_ratio",
+                                      train_dat = Training_sample_R, 
+                                      test_dat = Test_sample_R)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = "hide"}
+min_k_train <- performances %>%
+  group_by(num_vars) %>% # Smallest training error per number of covariates used
+  summarise(min_training_error = min(training_error))
+min_k_train
+# Probably 4 variables is good
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE, results = "hide"}
+min_k_test <- performances %>%
+  group_by(num_vars) %>% # Smallest test error per number of covariates used
+  summarise(test_error = min(test_error))
+min_k_test
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+which(performances$test_error == min(performances$test_error))
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+best <- which.min(performances$test_error)
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+performances[best, ]
+all_models(max_X)[[best]]
+```
+
+
+
+
+
+# Regression:
+## Linear Models
+
+### Best Subset / Forward & Backward Subset
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# Forward Stepwise
+forward_selection <- regsubsets(Attendance_ratio ~ ., data = Data, nvmax = 12, 
+                                method = "forward")
+forward_sum <- summary(forward_selection)
+data.frame(
+  Adj.R2 = which.max(forward_sum$adjr2),
+  CP = which.min(forward_sum$cp),
+  BIC = which.min(forward_sum$bic)
+)
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# Let us do forward selection according to BIC
+forward_adjr2_model <- data.frame(selected = 
+                     as.matrix(forward_sum$which[which.min(forward_sum$adjr2),  ]))
+# Look at the selected variables
+forward_adjr2_model <- dplyr::filter(forward_adjr2_model, selected == TRUE)
+forward_adjr2_model$variable <- row.names(forward_adjr2_model) 
+forward_adjr2_model$variable
+```
+
+
+Run regsubsets with BIC AIC and Adj2 and show the best 1 variable and 2 variable etc.
+```{r, echo = FALSE, message = FALSE, results = "hide"} 
+# Just run best
+
+# Best Subset
+subset_selection <- regsubsets(Attendance_ratio ~ ., data = Data, nvmax = 12, really.big=T)
+# Show the different measures after all the models are estimated
+subset_sum <- summary(subset_selection)
+data.frame( Adj.R2 = which.max(subset_sum$adjr2),
+            CP = which.min(subset_sum$cp),
+            BIC = which.min(subset_sum$bic))
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# Let us do best subset selection according to adjusted R squared
+subset_adjr2_model <- data.frame(selected =
+              as.matrix(subset_sum$which[which.max(subset_sum$adjr2), ]))
+# Look at the selected variables
+subset_adjr2_model <- dplyr::filter(subset_adjr2_model, selected == TRUE)
+subset_adjr2_model$variable <- row.names(subset_adjr2_model) 
+subset_adjr2_model$variable
+```
+
+### OLS 1
+```{r}
+StdData <- Data %>%
+  mutate(income= income/10000)
+#StdData[StdData == -Inf] <- 0  #for log
+  
+# Running on full model
+Best1 <- lm(Attendance_ratio ~ age_parent + ndays_absentsick + ndays_absentother + commute_home_preschool + parent_picks + parent_takescare + copayment_amount + pref3_miss + income, data = Data)
+summary(Best1)
+```
+
+```{r}
+best_subset_fit <- mse(Model)
+```
+
+```{r}
+best_fit <- predict(Best1, newdata = Test_sample)
+```
+
+### OLS 2
+```{r}
+Best2 <- lm(Attendance_ratio ~ ndays_absentsick + ndays_absentother + work_predictable + commute_home_preschool + parent_takescare, data =Data)
+summary(Best2)
+```
+
+```{r, message = FALSE, echo = FALSE, out.width = '100%', fig.width = 20, fig.height = 8, warning = FALSE}
+rss_measures <- data.frame(variables = 1:12, value = subset_sum$rss, criterion = "RSS", optimal = min(subset_sum$rss), optimal_number = which.min(subset_sum$rss))
+adjr2_measures <- data.frame(variables = 1:12, value = subset_sum$adjr2, criterion = "Adj-R2", optimal = max(subset_sum$adjr2), optimal_number = which.max(subset_sum$adjr2))
+cp_measures <- data.frame(variables = 1:12, value = subset_sum$cp, criterion = "Cp", optimal = min(subset_sum$cp), optimal_number = which.min(subset_sum$cp))
+bic_measures <- data.frame(variables = 1:12, value = subset_sum$bic, criterion = "BIC", optimal = min(subset_sum$bic), optimal_number = which.min(subset_sum$bic))
+
+dat <- rbind(rss_measures, adjr2_measures, cp_measures, bic_measures)
+
+ggplot(data = dat, aes(x = variables)) +
+  geom_line(aes(y = value, colour = criterion), size = 2) +
+  geom_point(aes(x = optimal_number, y = optimal), colour = "red", size = 4) +
+  labs(colour = 'Criterion') +
+  scale_x_continuous(breaks = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)) +
+    facet_wrap(~ criterion, scales = "free") +  theme(axis.title.x = element_text(family = "serif", size = 25),       # Changes fonts into times new roman
+        axis.title.y = element_text(family = "serif", size = 25),
+        legend.text = element_text(family = "serif", size = 25),
+        legend.title = element_text(family = "serif", size = 25),
+                  axis.text = element_text(size = 22)   )  
+
+```
+
+
+
+### Dimension Reduction
+# Not really used much for prediction or estimation
+
+###  Validation Sets
+```{r}
+best_combi <- all_models(max_X)[[best]]
+best_combi
+final_model <- lm(gen_formula("Attendance_ratio", best_combi), data = Test_sample)
+validation_set_fit <- final_model$fitted
+```
+
+We rerun with the best variables and just the test data
+
+Forget the cross validation -> we can do the below instead
+
+could do a 2-fold cross validation by turning around the test and training sample in validation sets
+we will get 2 test MSEs. First run validation sets normal, then switch the two samples
+
+### OLS 3
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+ValSet <- lm(Attendance_ratio ~ age_parent + birthweight + ndays_absentsick + work_predictable + commute_home_work + parent_picks + safe + parent_takescare + copayment_amount + income, data = Data)
+summary(ValSet)
+ValSet2 <- lm(Attendance_ratio ~ age_parent + birthweight + ndays_absentsick + work_predictable + commute_home_work + parent_picks, data = Data)
+summary(ValSet2)
+```
+
+### Cross Validation
+
+```{r}
+# R program to implement
+# Leave one out cross validation
+ 
+# defining training control
+# as Leave One Out Cross Validation
+train_control <- trainControl(method = "LOOCV")
+ 
+# training the model by assigning sales column
+# as target variable and rest other column
+# as independent variable
+model <- train(Attendance_ratio ~., data = Training_sample,
+               method = "lm",
+               trControl = train_control)
+ 
+# printing model performance metrics
+# along with other details
+print(model)
+```
+Advantages:
+
+Fast computation speed.
+A very effective method to estimate the prediction error and the accuracy of a model.
+Disadvantages:
+
+A lower value of K leads to a biased model and a higher value of K can lead to variability in the performance metrics of the model. Thus, it is very important to use the correct value of K for the model(generally K = 5 and K = 10 is desirable).
+
+```{r}
+
+# R program to implement
+# K-fold cross-validation
+ 
+# setting seed to generate a
+# reproducible random sampling
+set.seed(125)
+ 
+# defining training control
+# as cross-validation and
+# value of K equal to 10
+train_control <- trainControl(method = "cv",
+                              number = 10)
+ 
+# training the model by assigning sales column
+# as target variable and rest other column
+# as independent variable
+cv_model <- train(Attendance_ratio ~., data = Data,
+               method = "lm",
+               trControl = train_control)
+ 
+# printing model performance metrics
+# along with other details
+print(cv_model)
+cv10_mse <- cv_model$results[[2]]
+
+```
+
+
+```{r}
+varimp_vc <- varImp(cv_model)
+plot(varimp_vc, main="Variable Importance with CV")
+```
+### OLS 4
+```{r}
+CV <- lm(Attendance_ratio ~ income + ndays_absentother + commute_home_preschool + copayment_amount + ndays_absentsick + parent_takescare + parent_picks + age_parent + work_predictable, data = Data)
+summary(CV)
+```
+
+
+Advantages:
+
+Fast computation speed.
+A very effective method to estimate the prediction error and the accuracy of a model.
+Disadvantages:
+
+A lower value of K leads to a biased model and a higher value of K can lead to variability in the performance metrics of the model. Thus, it is very important to use the correct value of K for the model(generally K = 5 and K = 10 is desirable).
+
+### Shrinkage Methods
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# Ridge regression
+
+# run these on the whole dataser, but test only on the test data
+cv_ridge <- cv.glmnet(x = data.matrix(Training_sample[ , 2:K ]), y = Training_sample$Attendance_ratio, alpha = 0)
+ridge_lambda <- cv_ridge$lambda.min # optimal lambda
+
+ridge <- glmnet(y = Training_sample$Attendance_ratio, x = Training_sample[ , 2:K ], alpha = 0, family = "gaussian")
+# make predictions
+ridge_fit <- predict(ridge, newx = data.matrix(Test_sample[ , 2:K ]), s = ridge_lambda )
+
+# LASSO regression
+cv_lasso <- cv.glmnet(x = data.matrix(Training_sample[ , 2:K ]), y = Training_sample$Attendance_ratio, alpha = 1)
+lasso_lambda <- cv_lasso$lambda.min # optimal lambda
+
+lasso <- glmnet(y = Training_sample$Attendance_ratio, x = Training_sample[ , 2:K ], alpha = 1, family="gaussian")
+# make predictions
+lasso_fit <- predict(lasso, newx = data.matrix(Test_sample[ , 2:K ]), s = lasso_lambda) 
+
+# Elastic net
+cv_net <- cv.glmnet(x = data.matrix(Training_sample[ , 2:K ]), y = Training_sample$Attendance_ratio, 
+                    alpha = 0.5, family = "gaussian")
+net_lambda <- cv_net$lambda.min  # optimal lambda for elastic nets
+elastic_net <- glmnet(y = Training_sample$Attendance_ratio, x = Training_sample[ , 2:K ], 
+                      alpha = 0.5, family = "gaussian"  )
+# make predictions
+elastic_fit <- predict(elastic_net, newx = data.matrix(Test_sample[ , 2:K ]), s = net_lambda) 
+summary(elastic_fit)
+plot(elastic_fit)
+```
+
+## K Nearest Neighbours
+```{r}
+library(caret)
+#confusionMatrix(table(knn.11 ,test.mod_labels))
+set.seed(123)
+modelknn <- train(
+  Attendance_ratio ~., data = Training_sample, method = "knn",
+  trControl = trainControl("cv", number = 10),
+  preProcess = c("center","scale"),
+  tuneLength = 20
+  )
+# Plot model accuracy vs different values of k
+plot(modelknn)
+modelknn$bestTune
+predicted.classes <- modelknn %>% predict(Test_sample)
+head(predicted.classes)
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+#Againfor continuous variable 
+set.seed(123)
+modelknn2 <- train(
+  Attendance_ratio~., data = Training_sample, method = "knn",
+  trControl = trainControl("cv", number = 10),
+  preProcess = c("center","scale"),
+  tuneLength = 10
+  )
+# Plot model error RMSE vs different values of k
+plot(modelknn2)
+# Best tuning parameter k that minimize the RMSE
+modelknn2$bestTune
+# Make predictions on the test data
+predictions <- modelknn2 %>% predict(Test_sample)
+head(predictions)
+# Compute the prediction error RMSE
+RMSE(predictions, Test_sample$Attendance_ratio)
+```
+
+
+## Kernel Estimators
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# Local linear estimator
+Training_sample_df <- as.data.frame(Training_sample)
+Test_sample_df <- as.data.frame(Test_sample)
+bw_ll <- npregbw(ydat = Training_sample_df[, 1], xdat = Training_sample[, -1], regtype = "ll",
+ckertype = "epanechnikov")
+model_ll <- npreg(bws = bw_ll, newdata = Training_sample)
+# Using the optimal bandwidth on the third data set
+model_ll <- npreg(bws = bw_ll$bw, ydat = Test_sample_df[, 1], xdat = Test_sample[, -1],
+regtype = "ll", ckertype = "epanechnikov")
+# Get the predictions
+ll_fit <- model_ll$mean
+```
+
+
+## Trees & Random Forests
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+tree_preschool <- rpart(Attendance_ratio ~ ., data = Data, method = "anova")
+summary(tree_preschool )
+plotcp(tree_preschool)
+printcp(tree_preschool)
+rpart.plot(tree_preschool)
+```
+
+### OLS 5
+```{r}
+Tree <- lm(Attendance_ratio ~ copayment_amount + ndays_absentother + commute_home_work + parent_drops + working_hours + pref5_miss + income, data = Data)
+summary(Tree)
+```
+
+
+```{r}
+# Figure out the best tree on the overall sample 
+# Pruning is taking care of overfitting, no need to do validation sets
+# Predict the test sample
+tree_fit <- predict(tree_preschool, newdata = Test_sample)
+```
+
+## Maybe we can make a random forest plot or something?
+
+```{r}
+# Random Forests
+# Make predictions using the whole sample 
+# Pruning is done for each tree, so overfitting is taken care of
+rf_preschool <- randomForest(Attendance_ratio ~., data = Data)
+# Predict the test sample
+rf_pred <- predict(rf_preschool, newdata = Test_sample)
+```
+
+```{r, echo = FALSE, out.width = '70%'}
+tree_pred <- predict(tree_preschool, newdata = Test_sample)
+dat <- data.frame(Test_sample, tree_pred, rf_pred)
+
+ggplot(data = dat) +
+  geom_point(aes(x = rf_pred, y = Attendance_ratio, color = "Random forest"))+
+  geom_point(aes(x = tree_pred, y = Attendance_ratio, color = "Tree"))+
+
+  xlab("Predictions") +
+  ylab("Data") +
+    # scale_color_discrete(labels = c("Random forest", "Tree")) +
+   labs(color = 'Model',
+        title = "Seeing the Forest through the Trees")+
+    scale_color_manual(values = c('Tree' = 'red',
+                                  "Random forest" = 'blue')) +
+  theme(axis.title.x = element_text(family = "serif"),       # Changes fonts into times new roman
+        axis.title.y = element_text(family = "serif"),
+        legend.text = element_text(family = "serif"),
+        legend.title = element_text(family = "serif"))
+```
+
+## Neural Networks
+
+```{r, message = FALSE}
+nn_preschool <- neuralnet(Attendance_ratio ~ birthweight + work_predictable + ndays_absentother + parent_picks + commute_home_preschool + sendifsick + parent_takescare, 
+                         data = Data, hidden = c(2, 2, 2), 
+                         stepmax = 1000000, lifesign = "full")
+nn_pred <- predict(nn_preschool, newdata = Test_sample[, -c(2, 3, 4)], all.units = FALSE)
+```
+
+
+
+## Prediction Performance
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+ MSE <- function(y, fhat)
+ {
+   mse <- mean((y - fhat)^2)
+   return (mse)
+ }
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# LASSO
+lasso_mse <- MSE(Test_sample$Attendance_ratio, lasso_fit)
+# Ridge
+ridge_mse <- MSE(Test_sample$Attendance_ratio, ridge_fit)
+# Elastic net
+elastic_mse <- MSE(Test_sample$Attendance_ratio, elastic_fit)
+# Validation sets
+validation_mse <- MSE(Test_sample$Attendance_ratio, validation_set_fit)
+# Best Subset
+best_subset_mse <- MSE(Test_sample$Attendance_ratio, best_fit)
+# kernels
+kernel_mse <- MSE(Test_sample$Attendance_ratio, ll_fit)
+# Nearest neighbours
+knn_mse <- MSE(Test_sample$Attendance_ratio, predictions)
+# Trees
+tree_mse <- MSE(Test_sample$Attendance_ratio, tree_fit)
+# Random forest
+rf_mse <- MSE(Test_sample$Attendance_ratio, rf_pred)
+# Neural networks
+nn_mse <- MSE(Test_sample$Attendance_ratio, nn_pred)
+```
+
+```{r, echo = FALSE, message = FALSE, results = "hide"}
+# For when we have them all
+methods <- c("LASSO", "Ridge", "Elastic net", "OLS (Validation sets)", "Best Subset", "Cross Validation (10 Fold)", "Tree", "Random forest", "Kernel", "K-nn", "Neural networks")
+perfs <- c(sqrt(lasso_mse), sqrt(ridge_mse), sqrt(elastic_mse), sqrt(validation_mse), sqrt(best_subset_mse), cv10_mse, sqrt(tree_mse), sqrt(rf_mse), sqrt(kernel_mse), sqrt(knn_mse), sqrt(nn_mse))
+  
+perf_table <- data.frame(Method = methods, Test_MSE = perfs)
+
+perf_table <- perf_table %>% arrange(Test_MSE)
+perf_table
+```
+## PCA
+
+```{r}
+PCAData <- Data %>%
+  select(2:17,28,45:50)
+
+results <- prcomp(PCAData, scale = TRUE, center = TRUE)
+
+summary(results)
+results$rotation
+library(factoextra)
+fviz_eig(results, 
+         addlabels = TRUE, 
+         ylim = c(0, 70))
+
+fviz_pca_biplot(results,
+                label="var", select.var = list(contrib=10), repel = T)
+```
+
+
+```{r}
+fviz_screeplot(results, addlabels = TRUE, ylim = c(0, 50))
+fviz_pca_var(results, col.var="contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),select.var = list(contrib=10), repel = T)
+
+# contribute for each axes
+fviz_contrib(results, choice = "var", axes = 1, top = 5)
+fviz_contrib(results, choice = "var", axes = 2, top = 5)
+
+
+```
+
+
+
+
+
+
+```{r}
+#Best1  Best2 ValSet CV Tree
+library(stargazer)
+
+stargazer(Best1,ValSet,CV,title = "Results",omit.stat=c("LL","ser","f"), single.row = TRUE, report = "vc*", no.space=TRUE, column.labels = c("Best","ValSet", "CV"))
+
+```
+
