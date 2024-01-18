@@ -4,7 +4,7 @@ Machine Learning on Predicting Preschool Presence
 Groups of 2 
 
 Machine learning using R
-Report and anaylsis
+Report and analysis
 
 Abstract: 
 
