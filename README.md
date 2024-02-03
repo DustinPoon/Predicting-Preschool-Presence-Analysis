@@ -1,4 +1,4 @@
-# Who-is-Missing-Predicting-Preschool-Presence
+# Who is Missing? Predicting Preschool Presence
 Machine Learning on Predicting Preschool Presence
 
 Groups of 2 (ECON 483)
